@@ -445,6 +445,121 @@ export function formatFollowupSubject(templateSubject = 'Re:', existingSubject =
   return `${prefix} ${rawSubj}`.trim();
 }
 
+/**
+ * Calculates randomized jitter delay for follow-ups respecting Settings (min_delay_seconds & max_delay_seconds)
+ */
+export function calculateFollowupDelay(settings = {}) {
+  const throttleMode = String(settings.throttle_mode || 'adaptive').toLowerCase();
+  const isBulkMode = throttleMode === 'bulk' || throttleMode === 'fixed' || throttleMode === 'turbo';
+
+  const defaultMin = isBulkMode ? 1 : 15;
+  const defaultMax = isBulkMode ? 3 : 30;
+
+  const rawMin = parseInt(settings.min_delay_seconds, 10);
+  const rawMax = parseInt(settings.max_delay_seconds, 10);
+
+  const minSec = !isNaN(rawMin) && rawMin >= 0 ? rawMin : defaultMin;
+  const maxSec = !isNaN(rawMax) && rawMax >= minSec ? rawMax : Math.max(minSec, defaultMax);
+
+  const minMs = minSec * 1000;
+  const maxMs = maxSec * 1000;
+
+  return Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
+}
+
+/**
+ * Live pre-flight check to verify if a lead's status changed concurrently during long batch runs
+ */
+export function shouldSkipLeadDueToStatusChange(liveRowData = [], headers = [], context = 'outreach') {
+  if (!liveRowData || !liveRowData.length) return { shouldSkip: false };
+  const col = Object.fromEntries(headers.map((h, i) => [h.trim(), i]));
+  const status = (liveRowData[col['Sent Status']] || '').trim().toLowerCase();
+  const sentiment = (liveRowData[col['Sentiment'] ?? col['Next Follow Up Date']] || '').trim().toUpperCase();
+  const followUpStatus = (liveRowData[col['Follow up']] || '').trim().toLowerCase();
+
+  if (status === 'replied' || sentiment === 'POSITIVE' || sentiment === 'NEUTRAL') {
+    return { shouldSkip: true, reason: 'already replied' };
+  }
+  if (status === 'suppressed' || sentiment === 'SUPPRESSED') {
+    return { shouldSkip: true, reason: 'already suppressed' };
+  }
+  if (status === 'bounced') {
+    return { shouldSkip: true, reason: 'already bounced' };
+  }
+
+  if (context === 'followup') {
+    if (followUpStatus === 'done') {
+      return { shouldSkip: true, reason: 'followup already completed' };
+    }
+    // Eligible sent lead proceeds with followup
+    return { shouldSkip: false };
+  }
+
+  // Outreach mode: skip if already sent
+  if (status === 'sent') {
+    return { shouldSkip: true, reason: 'already sent' };
+  }
+  return { shouldSkip: false };
+}
+
+/**
+ * Merges updates from cold outreach/followup onto a live row preserving valuable fields like Phone & Sentiment
+ */
+export function mergeOutreachUpdatePreservingData(memoryRow = [], liveRow = [], headers = [], updates = {}) {
+  const base = liveRow && liveRow.length ? [...liveRow] : [...memoryRow];
+  const col = Object.fromEntries(headers.map((h, i) => [h.trim(), i]));
+
+  // Ensure row has sufficient length
+  while (base.length < headers.length) {
+    base.push('');
+  }
+
+  // Preserve critical inbound reply data from liveRow if present
+  const phoneCol = col['Phone'] ?? col['phone'] ?? col['Phone Number'] ?? col['phone_number'];
+  if (phoneCol !== undefined && liveRow && liveRow[phoneCol]) {
+    base[phoneCol] = liveRow[phoneCol];
+  }
+  const sentimentCol = col['Sentiment'] ?? col['Next Follow Up Date'];
+  if (sentimentCol !== undefined && liveRow && liveRow[sentimentCol] && !updates['Sentiment'] && !updates['Next Follow Up Date']) {
+    base[sentimentCol] = liveRow[sentimentCol];
+  }
+
+  // Apply explicit updates
+  for (const [key, val] of Object.entries(updates)) {
+    const idx = col[key];
+    if (idx !== undefined) {
+      base[idx] = val;
+    }
+  }
+
+  return base;
+}
+
+/**
+ * Filter logic for inbox messages to prevent duplicate processing within a batch
+ * and avoid spamming Discord alerts for already seen replies
+ */
+export function shouldProcessInboxMessage(msg = {}, fromEmail = '', isExistingLead = false, processedFromAddrs = new Set()) {
+  const cleanEmail = (fromEmail || '').toLowerCase().trim();
+  if (!cleanEmail) {
+    return { shouldProcess: false, reason: 'missing sender email' };
+  }
+
+  // 1. Intra-batch deduplication
+  if (processedFromAddrs.has(cleanEmail)) {
+    return { shouldProcess: false, reason: 'duplicate sender in current batch' };
+  }
+
+  // 2. Inter-run deduplication: if message is already marked \Seen and lead is already recorded as replied, skip re-notifying
+  const isSeen = msg?.flags instanceof Set ? msg.flags.has('\\Seen') : (Array.isArray(msg?.flags) && msg.flags.includes('\\Seen'));
+  if (isSeen && isExistingLead) {
+    return { shouldProcess: false, reason: 'already seen and lead already recorded as replied' };
+  }
+
+  processedFromAddrs.add(cleanEmail);
+  return { shouldProcess: true };
+}
+
 // ============================================================================
 // 🚀 1. COLD OUTREACH SENDER
 // ============================================================================
@@ -616,6 +731,21 @@ export async function runColdOutreach() {
       break;
     }
 
+    // 🛡️ Live Pre-flight check: Verify if status changed concurrently in Sheet during long batch
+    const rowNum = i + 2;
+    try {
+      const liveCheckRes = await sheets.spreadsheets.values.get({
+        spreadsheetId: sheets.spreadsheetId || SPREADSHEET_ID,
+        range: `'Details'!A${rowNum}:Z${rowNum}`
+      });
+      const liveRow = liveCheckRes.data.values?.[0];
+      const skipDecision = shouldSkipLeadDueToStatusChange(liveRow, headers, 'outreach');
+      if (skipDecision.shouldSkip) {
+        console.log(`ℹ️ Lead [${email}] status changed concurrently in sheet (${skipDecision.reason}). Skipping send to prevent overwrite.`);
+        continue;
+      }
+    } catch (_) {}
+
     // Find inbox under daily limit
     let inbox = null;
     for (let attempt = 0; attempt < config.inboxes.length; attempt++) {
@@ -738,21 +868,34 @@ export async function runColdOutreach() {
 
       console.log(`[Sent] "${senderName}" <${senderEmail}> -> ${email}`);
 
-      // Update row in sheet
+      // Update row in sheet preserving any inbound replies/phone data captured concurrently
       const rowNum = i + 2;
-      row[col['Subject Line']] = subject;
-      row[col['Sent From']] = senderEmail;
-      row[col['Sent Status']] = 'SENT';
-      row[col['Time']] = new Date().toLocaleTimeString('en-US', { timeZone: 'Asia/Kolkata', hour12: true });
-      row[col['Date Sent']] = new Date().toLocaleDateString('en-GB', { timeZone: 'Asia/Kolkata' });
-      row[col['Follow Up Count']] = 0;
-      row[col['Follow up']] = '';
+      const updates = {
+        'Subject Line': subject,
+        'Sent From': senderEmail,
+        'Sent Status': 'SENT',
+        'Time': new Date().toLocaleTimeString('en-US', { timeZone: 'Asia/Kolkata', hour12: true }),
+        'Date Sent': new Date().toLocaleDateString('en-GB', { timeZone: 'Asia/Kolkata' }),
+        'Follow Up Count': 0,
+        'Follow up': ''
+      };
+
+      let liveRowData = null;
+      try {
+        const liveRes = await sheets.spreadsheets.values.get({
+          spreadsheetId: sheets.spreadsheetId || SPREADSHEET_ID,
+          range: `'Details'!A${rowNum}:Z${rowNum}`
+        });
+        liveRowData = liveRes.data.values?.[0];
+      } catch (_) {}
+
+      const mergedRow = mergeOutreachUpdatePreservingData(row, liveRowData, headers, updates);
 
       await sendWithRetry(() => sheets.spreadsheets.values.update({
         spreadsheetId: sheets.spreadsheetId || SPREADSHEET_ID,
         range: `'Details'!A${rowNum}:Z${rowNum}`,
         valueInputOption: 'USER_ENTERED',
-        requestBody: { values: [row] },
+        requestBody: { values: [mergedRow] },
       }));
     } catch (err) {
       console.error(`Failed to send to ${email}:`, err.message);
@@ -1265,6 +1408,21 @@ export async function runFollowups(sheetsObj = null, customConfig = null) {
       if (dueDate && today < dueDate) continue;
     }
 
+    // 🛡️ Live Pre-flight check: Verify if status changed concurrently in Sheet during long batch
+    const rowNum = i + 2;
+    try {
+      const liveCheckRes = await sheets.spreadsheets.values.get({
+        spreadsheetId: sheets.spreadsheetId || SPREADSHEET_ID,
+        range: `'Details'!A${rowNum}:Z${rowNum}`
+      });
+      const liveRow = liveCheckRes.data.values?.[0];
+      const skipDecision = shouldSkipLeadDueToStatusChange(liveRow, headers, 'followup');
+      if (skipDecision.shouldSkip) {
+        console.log(`ℹ️ Follow-up lead [${email}] status changed concurrently in sheet (${skipDecision.reason}). Skipping send to prevent overwrite.`);
+        continue;
+      }
+    } catch (_) {}
+
     const nextCount = currentCount + 1;
     if (config.followupTemplates.length > 0 && nextCount > config.followupTemplates.length) {
       const rowNum = i + 2;
@@ -1366,17 +1524,34 @@ export async function runFollowups(sheetsObj = null, customConfig = null) {
       }
 
       const rowNum = i + 2;
-      row[col['Follow Up Count']] = nextCount;
-      row[col['Next Follow Up Date']] = nextDateStr;
-      if (nextCount >= config.followupTemplates.length) {
-        row[col['Follow up']] = 'Done';
+      const updates = {
+        'Date Sent': new Date().toLocaleDateString('en-GB', { timeZone: 'Asia/Kolkata' }),
+        'Follow Up Count': nextCount,
+        'Next Follow Up Date': nextDateStr
+      };
+      if (col['Time'] !== undefined) {
+        updates['Time'] = new Date().toLocaleTimeString('en-US', { timeZone: 'Asia/Kolkata', hour12: true });
       }
+      if (nextCount >= config.followupTemplates.length) {
+        updates['Follow up'] = 'Done';
+      }
+
+      let freshLiveRow = null;
+      try {
+        const freshRes = await sheets.spreadsheets.values.get({
+          spreadsheetId: sheets.spreadsheetId || SPREADSHEET_ID,
+          range: `'Details'!A${rowNum}:Z${rowNum}`
+        });
+        freshLiveRow = freshRes.data.values?.[0];
+      } catch (_) {}
+
+      const mergedRow = mergeOutreachUpdatePreservingData(row, freshLiveRow, headers, updates);
 
       await sendWithRetry(() => sheets.spreadsheets.values.update({
         spreadsheetId: sheets.spreadsheetId || SPREADSHEET_ID,
         range: `'Details'!A${rowNum}:Z${rowNum}`,
         valueInputOption: 'USER_ENTERED',
-        requestBody: { values: [row] },
+        requestBody: { values: [mergedRow] },
       }), { retries: 2 });
     } catch (e) {
       console.error(`Follow-up failed for ${email}:`, e.message);
@@ -1420,11 +1595,7 @@ export async function runFollowups(sheetsObj = null, customConfig = null) {
       }
     }
 
-    const throttleMode = String(config.settings.throttle_mode || 'adaptive').toLowerCase();
-    const isBulkMode = throttleMode === 'bulk' || throttleMode === 'fixed' || throttleMode === 'turbo';
-    const minD = Math.max(0, parseInt(config.settings.min_delay_seconds || (isBulkMode ? '1' : '15'), 10) * 1000);
-    const maxD = Math.max(minD, parseInt(config.settings.max_delay_seconds || (isBulkMode ? '3' : '30'), 10) * 1000);
-    const delay = isBulkMode ? Math.floor(Math.random() * (maxD - minD + 1)) + minD : 20000;
+    const delay = calculateFollowupDelay(config.settings);
     await new Promise(r => setTimeout(r, delay));
   }
 }
@@ -1829,6 +2000,12 @@ export async function runInboxChecker() {
 
           // Check if lead was ALREADY positive/neutral or already marked as replied
           const isExistingLead = existingStatus === 'replied' || existingSentiment === 'POSITIVE' || existingSentiment === 'NEUTRAL';
+
+          // 🛡️ Deduplicate inside current run & suppress duplicate alerts for previously seen messages
+          const processDecision = shouldProcessInboxMessage(msg, fromAddr, isExistingLead, processedFromAddrs);
+          if (!processDecision.shouldProcess) {
+            continue;
+          }
 
           const emailSubject = parsed.subject || '';
           const emailBody = parsed.text || '';
