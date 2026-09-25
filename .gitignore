@@ -15,6 +15,7 @@ node_modules/
 # Local AI Agent Customizations
 .agents/
 .ecc/
+.claude/
 AGENTS.md
 
 # Logs & Temporary files
@@ -28,6 +29,11 @@ scratch/
 __pycache__/
 *.pyc
 *.db
+
+# Local Data & Backups
+*.xlsx
+*.backup-*
+
 
 # OS metadata
 .DS_Store

@@ -484,6 +484,20 @@ export async function runColdOutreach() {
   const runStartTime = Date.now();
   const maxRuntimeMs = parseInt(config.settings.max_runtime_minutes || '315', 10) * 60 * 1000;
 
+  // 🛡️ Build in-memory prior history map across all rows to catch duplicate contacts (BUG-02, BUG-05)
+  const priorLeadHistory = new Map();
+  for (let idx = 0; idx < rows.length; idx++) {
+    const r = rows[idx];
+    const e = (r[col['email']] || '').trim().toLowerCase();
+    const s = (r[col['Sent Status']] || '').trim().toLowerCase();
+    const sentiment = (r[col['Sentiment'] ?? col['Next Follow Up Date']] || '').trim().toUpperCase();
+    if (e && s && ['sent', 'replied', 'bounced', 'suppressed'].includes(s)) {
+      if (!priorLeadHistory.has(e)) {
+        priorLeadHistory.set(e, { status: s, sentiment, row: idx + 2 });
+      }
+    }
+  }
+
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
     const email = (row[col['email']] || '').trim();
@@ -493,6 +507,31 @@ export async function runColdOutreach() {
     if (!email || status === 'sent' || status === 'replied' || status === 'bounced' || status === 'suppressed' || status === 'draft — pending review') {
       continue;
     }
+
+    // 🛡️ In-memory pre-send deduplication: Check if this email was already contacted/bounced/replied earlier
+    const dupCheck = isLeadDuplicateOrContacted(email, priorLeadHistory);
+    if (dupCheck.isDuplicate) {
+      console.log(`⚠️ Duplicate lead detected in unsent queue: ${email} (${dupCheck.reason} at row ${dupCheck.priorRow}). Skipping send.`);
+      const rowNum = i + 2;
+      row[col['Sent Status']] = dupCheck.reason === 'already bounced' ? 'bounced' : (dupCheck.reason === 'already replied' ? 'replied' : 'duplicate — already sent');
+      row[col['Follow up']] = 'Done';
+      if (dupCheck.sentiment) {
+        const sentimentCol = col['Sentiment'] ?? col['Next Follow Up Date'];
+        if (sentimentCol !== undefined) row[sentimentCol] = dupCheck.sentiment;
+      }
+      row[col['Time']] = new Date().toLocaleTimeString('en-US', { timeZone: 'Asia/Kolkata', hour12: true });
+
+      await sendWithRetry(() => sheets.spreadsheets.values.update({
+        spreadsheetId: sheets.spreadsheetId || SPREADSHEET_ID,
+        range: `'Details'!A${rowNum}:Z${rowNum}`,
+        valueInputOption: 'USER_ENTERED',
+        requestBody: { values: [row] },
+      }));
+      continue;
+    }
+
+    // Register email in prior history so duplicate leads within this run are also caught
+    priorLeadHistory.set(email.toLowerCase(), { status: 'sent', row: i + 2 });
 
     // 🛡️ Global Suppression Check
     const suppressed = await isSuppressed(email, async () => {
@@ -1421,15 +1460,15 @@ export function isBlacklistedPhone(phone, blacklist = DEFAULT_INTERNAL_PHONE_BLA
  * 1. Prepends apostrophe ' if the value starts with +, =, -, or @ to prevent arithmetic evaluation
  *    (e.g. +91-22-41207788 evaluating to -41207719 in USER_ENTERED mode).
  * 2. Clears formula placeholder text ("No positive leads recorded yet").
- * 3. Clears corrupted negative subtraction results (e.g. -41207719).
+ * 3. Clears corrupted negative subtraction results (e.g. -41207719) and formula errors (#ERROR!).
  */
 export function formatPhoneForSheets(phone) {
   if (!phone || typeof phone !== 'string') return '';
   const trimmed = phone.trim();
   if (!trimmed) return '';
 
-  // Filter out formula placeholder texts
-  if (/^no positive leads recorded yet$/i.test(trimmed)) {
+  // Filter out formula placeholder texts and formula errors
+  if (/^no positive leads recorded yet$/i.test(trimmed) || /^#(?:ERROR|VALUE|REF|N\/A|NAME\?|NUM!)!?$/i.test(trimmed)) {
     return '';
   }
 
@@ -1449,6 +1488,53 @@ export function formatPhoneForSheets(phone) {
   }
 
   return trimmed;
+}
+
+/**
+ * In-memory pre-send lead deduplication & history check.
+ * Identifies whether an email has already been contacted, replied, bounced, or suppressed.
+ */
+export function isLeadDuplicateOrContacted(email, priorHistory) {
+  if (!email || typeof email !== 'string') return { isDuplicate: false };
+  const normalized = email.trim().toLowerCase();
+  if (!priorHistory) return { isDuplicate: false };
+
+  let historyEntry = null;
+  if (priorHistory instanceof Map) {
+    historyEntry = priorHistory.get(normalized);
+  } else if (typeof priorHistory === 'object') {
+    historyEntry = priorHistory[normalized];
+  }
+
+  if (historyEntry) {
+    const status = (historyEntry.status || '').toLowerCase();
+    if (status === 'sent') {
+      return { isDuplicate: true, reason: 'previously sent', priorRow: historyEntry.row };
+    }
+    if (status === 'replied') {
+      return { isDuplicate: true, reason: 'already replied', sentiment: historyEntry.sentiment || '', priorRow: historyEntry.row };
+    }
+    if (status === 'bounced') {
+      return { isDuplicate: true, reason: 'already bounced', priorRow: historyEntry.row };
+    }
+    if (status === 'suppressed') {
+      return { isDuplicate: true, reason: 'suppressed', priorRow: historyEntry.row };
+    }
+    return { isDuplicate: true, reason: 'previously processed', priorRow: historyEntry.row };
+  }
+
+  return { isDuplicate: false };
+}
+
+/**
+ * Builds IMAP search query for recent time window.
+ * Avoids the trap of strictly { seen: false } which drops read messages.
+ */
+export function buildImapFetchQuery({ windowDays = 14 } = {}) {
+  const sinceDate = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000);
+  return {
+    since: sinceDate
+  };
 }
 
 /**
@@ -1668,26 +1754,17 @@ export async function runInboxChecker() {
       await client.connect();
       lock = await client.getMailboxLock('INBOX');
 
-      // 1. Fetch all unseen messages into memory so the IMAP fetch stream closes cleanly
-      const unseenMessages = [];
-      for await (const msg of client.fetch({ seen: false }, { uid: true, source: true })) {
-        unseenMessages.push(msg);
+      // 1. Fetch recent messages into memory (default past 14 days)
+      const windowDays = parseInt(config?.settings?.inbox_scan_window_days || '14', 10);
+      const fetchQuery = buildImapFetchQuery({ windowDays });
+      const messagesToProcess = [];
+      for await (const msg of client.fetch(fetchQuery, { uid: true, source: true, flags: true })) {
+        messagesToProcess.push(msg);
       }
 
-      // 2. Mark all unseen message UIDs as \Seen in one single batch command
-      const uidsToMark = unseenMessages.map(m => m.uid).filter(Boolean);
-      if (uidsToMark.length > 0) {
-        try {
-          await client.messageFlagsAdd(uidsToMark, ['\\Seen'], { uid: true });
-          console.log(`👁️ Marked ${uidsToMark.length} message(s) as \\Seen in ${inbox.email}`);
-        } catch (flagErr) {
-          console.warn(`Could not set \\Seen flags in ${inbox.email}:`, flagErr.message);
-        }
-      }
-
-      // 3. Process each message without blocking IMAP connection
+      // 2. Process each message without blocking IMAP connection (mark \Seen post-processing)
       const processedFromAddrs = new Set();
-      for (const msg of unseenMessages) {
+      for (const msg of messagesToProcess) {
         try {
           const parsed = await simpleParser(msg.source);
           const fromAddr = parsed.from?.value[0]?.address?.toLowerCase() || '';
@@ -1718,6 +1795,26 @@ export async function runInboxChecker() {
                 requestBody: { values: [rows[rIdx]] },
               }));
               console.log(`🔒 Marked [${match}] as BOUNCED & Follow-up as DONE`);
+
+              // 🛡️ Auto-suppress bounce in Suppressed tab (BUG-06)
+              try {
+                await addToSuppression(match, 'Hard Bounce / Invalid Domain', async (emailToSuppress, reason, timestamp) => {
+                  await ensureTabExists(sheets, 'Suppressed', ['email', 'reason', 'added_at']);
+                  const sheetsClient = sheets?.sheets || sheets;
+                  const spreadsheetId = sheets?.spreadsheetId || SPREADSHEET_ID;
+                  await sendWithRetry(() => sheetsClient.spreadsheets.values.append({
+                    spreadsheetId,
+                    range: "'Suppressed'!A:Z",
+                    valueInputOption: 'USER_ENTERED',
+                    requestBody: {
+                      values: [[emailToSuppress, reason, timestamp]],
+                    },
+                  }), { retries: 2 });
+                });
+                console.log(`⛔ Auto-suppressed bounce [${match}] in Suppressed tab.`);
+              } catch (suppErr) {
+                console.warn(`Could not add bounce ${match} to Suppressed tab:`, suppErr.message);
+              }
             }
           }
           continue;
@@ -1839,6 +1936,12 @@ export async function runInboxChecker() {
         }
       } catch (msgErr) {
         console.warn(`⚠️ Error processing message in ${inbox.email}:`, msgErr.message);
+      } finally {
+        if (msg.uid && !msg.flags?.has('\\Seen')) {
+          try {
+            await client.messageFlagsAdd([msg.uid], ['\\Seen'], { uid: true });
+          } catch (_) {}
+        }
       }
     }
   } catch (e) {
