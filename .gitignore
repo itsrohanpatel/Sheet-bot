@@ -38,3 +38,7 @@ apps-script/MasterRegistry.gs
 *MasterRegistry*
 *master.gs
 
+# Offline Action Runs Archive
+offline_runs/
+scripts/download-offline-runs.mjs
+

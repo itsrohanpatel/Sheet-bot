@@ -181,7 +181,7 @@ function createOutreachSystem(forceReset = false) {
         'Summary', 'Phone'
       ],
       sampleData: [
-        ['=IFERROR(FILTER(Details!A2:N, ISNUMBER(SEARCH("POSITIVE", Details!L2:L))), "No positive leads recorded yet")', '', '', '', '', '', '', '', '', '', '', '', '', '']
+        ['=IFERROR(FILTER(Details!A2:N, (ISNUMBER(SEARCH("replied", Details!G2:G))) * (ISNUMBER(SEARCH("POSITIVE", Details!L2:L)))), "No positive leads recorded yet")', '', '', '', '', '', '', '', '', '', '', '', '', '']
       ]
     }
   };
@@ -284,7 +284,7 @@ function createOutreachSystem(forceReset = false) {
       if (sheetName === 'Positive_Leads') {
         sheet.getRange('B2:Z2').clearContent();
         const formulaCell = sheet.getRange(2, 1);
-        const expectedFormula = '=IFERROR(FILTER(Details!A2:N, ISNUMBER(SEARCH("POSITIVE", Details!L2:L))), "No positive leads recorded yet")';
+        const expectedFormula = '=IFERROR(FILTER(Details!A2:N, (ISNUMBER(SEARCH("replied", Details!G2:G))) * (ISNUMBER(SEARCH("POSITIVE", Details!L2:L)))), "No positive leads recorded yet")';
         if (formulaCell.getFormula() !== expectedFormula) {
           formulaCell.setFormula(expectedFormula);
         }

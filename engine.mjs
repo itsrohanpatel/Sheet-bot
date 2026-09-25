@@ -1392,9 +1392,70 @@ export async function runFollowups(sheetsObj = null, customConfig = null) {
 
 /**
  * Deterministic fallback regex extractor for phone numbers from email text / signatures.
+/**
+ * Known internal team phone numbers to safeguard against accidental extraction from quoted footers.
+ */
+export const DEFAULT_INTERNAL_PHONE_BLACKLIST = [
+  '919829242624',
+  '9829242624',
+];
+
+/**
+ * Check if a phone number matches any blacklisted internal company numbers.
+ */
+export function isBlacklistedPhone(phone, blacklist = DEFAULT_INTERNAL_PHONE_BLACKLIST) {
+  if (!phone) return false;
+  const digits = String(phone).replace(/\D/g, '');
+  if (!digits) return false;
+  for (const b of blacklist) {
+    const bDigits = String(b).replace(/\D/g, '');
+    if (bDigits && (digits.endsWith(bDigits) || bDigits.endsWith(digits))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Sanitize and format phone number for Google Sheets.
+ * 1. Prepends apostrophe ' if the value starts with +, =, -, or @ to prevent arithmetic evaluation
+ *    (e.g. +91-22-41207788 evaluating to -41207719 in USER_ENTERED mode).
+ * 2. Clears formula placeholder text ("No positive leads recorded yet").
+ * 3. Clears corrupted negative subtraction results (e.g. -41207719).
+ */
+export function formatPhoneForSheets(phone) {
+  if (!phone || typeof phone !== 'string') return '';
+  const trimmed = phone.trim();
+  if (!trimmed) return '';
+
+  // Filter out formula placeholder texts
+  if (/^no positive leads recorded yet$/i.test(trimmed)) {
+    return '';
+  }
+
+  // Filter out negative arithmetic results like -41207719 from earlier corrupted evaluations
+  if (/^-\d{5,}$/.test(trimmed)) {
+    return '';
+  }
+
+  // If already escaped with leading apostrophe, return as is
+  if (trimmed.startsWith("'")) {
+    return trimmed;
+  }
+
+  // If phone starts with +, =, -, @, prepend a single quote to force Google Sheets plain text mode
+  if (/^[+=@\-]/.test(trimmed)) {
+    return `'${trimmed}`;
+  }
+
+  return trimmed;
+}
+
+/**
+ * Deterministic fallback regex extractor for phone numbers from email text / signatures.
  * Extracts direct phone, mobile, cell, WhatsApp, or telephone numbers.
  */
-export function extractPhoneNumberFallback(text = '') {
+export function extractPhoneNumberFallback(text = '', options = {}) {
   if (!text || typeof text !== 'string') return '';
 
   // 🛡️ SENDER PHONE NUMBER SAFEGUARD:
@@ -1404,13 +1465,14 @@ export function extractPhoneNumberFallback(text = '') {
   if (!replyOnlyText) return '';
 
   const cleanText = replyOnlyText.replace(/\r\n/g, '\n');
+  const blacklist = options?.blacklistNumbers || DEFAULT_INTERNAL_PHONE_BLACKLIST;
 
-  // Pattern 1: Explicitly labeled numbers (e.g. Phone:, Mob:, Mobile:, Cell:, Tel:, WhatsApp:, Call:)
-  const labeledRegex = /(?:phone|mobile|mob|cell|tel|telephone|direct|call|whatsapp|contact|ph|m|o)\s*[:#–-]?\s*([+]?[(]?[0-9]{1,4}[)]?[-\s./]?(?:[(]?[0-9]{1,5}[)]?[-\s./]?){1,5}[0-9]{2,6})/i;
+  // Pattern 1: Explicitly labeled numbers (e.g. Phone:, Mob:, Mobile:, Cell:, Tel:, WhatsApp:, Call me at:)
+  const labeledRegex = /(?:phone|mobile|mob|cell|tel|telephone|direct|call|reach|whatsapp|contact|ph|m|o)(?:\s+(?:me|us))?(?:\s+(?:at|on))?\s*[:#–-]?\s*([+]?[(]?[0-9]{1,4}[)]?[-\s./]?(?:[(]?[0-9]{1,5}[)]?[-\s./]?){1,5}[0-9]{2,6})/i;
   const labeledMatch = cleanText.match(labeledRegex);
   if (labeledMatch && labeledMatch[1]) {
     const candidate = cleanCandidateNumber(labeledMatch[1]);
-    if (isValidPhoneNumber(candidate)) return candidate;
+    if (isValidPhoneNumber(candidate) && !isBlacklistedPhone(candidate, blacklist)) return candidate;
   }
 
   // Pattern 2: International formatted numbers (+XX ...)
@@ -1418,7 +1480,7 @@ export function extractPhoneNumberFallback(text = '') {
   let match;
   while ((match = intlRegex.exec(cleanText)) !== null) {
     const candidate = cleanCandidateNumber(match[1]);
-    if (isValidPhoneNumber(candidate)) return candidate;
+    if (isValidPhoneNumber(candidate) && !isBlacklistedPhone(candidate, blacklist)) return candidate;
   }
 
   // Pattern 3: Standard North American / UK / Indian domestic formatted numbers:
@@ -1426,7 +1488,14 @@ export function extractPhoneNumberFallback(text = '') {
   const domesticRegex = /(?:^|[\s,;:(])(\(?\d{3,5}\)?[-.\s]\d{3,4}[-.\s]\d{3,5})(?=[\s,;:).!?]|$)/gm;
   while ((match = domesticRegex.exec(cleanText)) !== null) {
     const candidate = cleanCandidateNumber(match[1]);
-    if (isValidPhoneNumber(candidate)) return candidate;
+    if (isValidPhoneNumber(candidate) && !isBlacklistedPhone(candidate, blacklist)) return candidate;
+  }
+
+  // Pattern 4: Plain 10-digit mobile numbers (e.g. 9880082711, 7376348774, 9116592910)
+  const plain10Regex = /(?:^|[\s,;:(])([6-9]\d{9})(?=[\s,;:).!?]|$)/gm;
+  while ((match = plain10Regex.exec(cleanText)) !== null) {
+    const candidate = cleanCandidateNumber(match[1]);
+    if (isValidPhoneNumber(candidate) && !isBlacklistedPhone(candidate, blacklist)) return candidate;
   }
 
   return '';
@@ -1457,7 +1526,7 @@ function isValidPhoneNumber(num) {
 }
 
 // Helper for AI Email Sentiment Classification, Summarization & Phone Extraction (Resilient Fallback)
-export async function classifyEmailWithAi(groq, emailText = '') {
+export async function classifyEmailWithAi(groq, emailText = '', options = {}) {
   // 🛡️ SENDER PHONE NUMBER SAFEGUARD:
   // Strip quoted reply history first so AI only analyzes the lead's new reply,
   // preventing false classification and preventing sender phone number extraction.
@@ -1465,7 +1534,8 @@ export async function classifyEmailWithAi(groq, emailText = '') {
   let sentiment = 'REPLIED';
   let summary = (cleanEmailText || emailText || '').trim().replace(/\s+/g, ' ').substring(0, 150);
   if (summary.length === 150) summary += '...';
-  let phone = extractPhoneNumberFallback(cleanEmailText);
+  const blacklist = options?.blacklistNumbers || DEFAULT_INTERNAL_PHONE_BLACKLIST;
+  let phone = extractPhoneNumberFallback(cleanEmailText, options);
 
   if (!groq || !cleanEmailText) {
     return { sentiment, summary, phone };
@@ -1491,11 +1561,22 @@ export async function classifyEmailWithAi(groq, emailText = '') {
   "phone": "Extracted phone, mobile, WhatsApp, or direct contact number from the lead's new reply or signature, or empty string \\"\\" if not found"
 }
 
-Definitions:
-- "POSITIVE": Interested, asking for pricing/call/demo, sharing calendar link, requesting info.
-- "NEUTRAL": Forwarded to another person, ask to reach back in a few months, generic reply.
-- "NEGATIVE": Not interested, asking to unsubscribe/remove, angry, not relevant.
-- "OOO": Automated Out of Office / Vacation auto-responder.
+Definitions & B2B Taxonomy:
+- "POSITIVE":
+  * Asking for pricing, quote, brochure, commercial terms, fee structure, or service charges.
+  * Agreeing to or requesting a call, meeting, Google Meet, or discussion (e.g. "let's connect Monday", "please call me", "share availability").
+  * Sharing specific job openings, vacancies, or role requirements (e.g. Full Stack Developer, sales executive, drivers, Coupa consultants).
+  * Inquiring about service capabilities, sectors, or domains (e.g. non-IT roles, US staffing, IT contract staffing).
+  * Proposing vendor empanelment, sub-vendor partnership, or collaboration terms.
+- "NEUTRAL":
+  * Forwarding or redirecting to another person or HR email/portal (e.g. "reach out to our HR head", "apply on our portal").
+  * Asking to check back in next quarter or in a few months.
+  * Inquiring if service is free / zero-cost basis without immediate rejection.
+  * Ambiguous or generic acknowledgments.
+- "NEGATIVE":
+  * Not interested, declining external services, stating no requirement currently or in future.
+  * Direct objection with no willingness to explore.
+- "OOO": Automated Out of Office / Vacation / Annual leave auto-responder.
 
 Phone Extraction Guidance:
 - Look ONLY in the lead's current message, closing, and signature block for contact numbers (e.g., "Mobile: +91 9880082711", "Call me at (555) 123-4567", "Tel: +1-800-555-0199", "WhatsApp: +44 7911 123456", "Phone: 9876543210").
@@ -1526,8 +1607,10 @@ Do NOT include markdown backticks or any conversational text. Return only the JS
       }
       if (parsedObj.phone !== undefined && parsedObj.phone !== null) {
         const aiPhone = cleanCandidateNumber(String(parsedObj.phone));
-        if (isValidPhoneNumber(aiPhone)) {
+        if (isValidPhoneNumber(aiPhone) && !isBlacklistedPhone(aiPhone, blacklist)) {
           phone = aiPhone;
+        } else if (isBlacklistedPhone(aiPhone, blacklist)) {
+          phone = '';
         }
       }
       return { sentiment, summary, phone };
@@ -1664,8 +1747,14 @@ export async function runInboxChecker() {
             rows[rIdx][sentimentCol] = sentiment;
           }
           const phoneColIdx = col['Phone'] ?? col['phone'] ?? col['Phone Number'] ?? col['phone_number'];
-          if (phoneColIdx !== undefined && phone) {
-            rows[rIdx][phoneColIdx] = phone;
+          if (phoneColIdx !== undefined) {
+            const formattedPhone = formatPhoneForSheets(phone);
+            if (formattedPhone) {
+              rows[rIdx][phoneColIdx] = formattedPhone;
+            } else if (rows[rIdx][phoneColIdx]) {
+              // Clear any legacy placeholder text or corrupted negative subtraction numbers
+              rows[rIdx][phoneColIdx] = formatPhoneForSheets(rows[rIdx][phoneColIdx]);
+            }
           }
           if (col['Summary'] !== undefined) {
             rows[rIdx][col['Summary']] = (phoneColIdx === undefined && phone)

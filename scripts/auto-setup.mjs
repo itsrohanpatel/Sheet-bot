@@ -229,7 +229,7 @@ export const COMPLETE_SCHEMA = {
       'Summary', 'Phone'
     ],
     sampleData: [
-      ['=IFERROR(FILTER(Details!A2:N, ISNUMBER(SEARCH("POSITIVE", Details!L2:L))), "No positive leads recorded yet")', '', '', '', '', '', '', '', '', '', '', '', '', '']
+      ['=IFERROR(FILTER(Details!A2:N, (ISNUMBER(SEARCH("replied", Details!G2:G))) * (ISNUMBER(SEARCH("POSITIVE", Details!L2:L)))), "No positive leads recorded yet")', '', '', '', '', '', '', '', '', '', '', '', '', '']
     ]
   }
 };

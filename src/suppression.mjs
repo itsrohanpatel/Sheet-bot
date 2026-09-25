@@ -80,9 +80,11 @@ export function stripQuotedReply(body = '') {
     /\r?\n\s*On\s+[\s\S]+?wrote:\s*$/im,
     /\r?\n\s*On\s+.*wrote:.*$/im,
     /\r?\n\s*-+\s*Original Message\s*-+/i,
-    /\r?\n\s*From:\s+[^\n]+@/i,
+    /\r?\n\s*-+\s*Forwarded message\s*-+/i,
+    /\r?\n\s*Begin forwarded message:/i,
+    /\r?\n\s*_{5,}/,
+    /\r?\n\s*\*?From:\*?\s+[^\n]+/i,
     /\r?\n\s*Sent by\s+/i,
-    /\r?\n\s*_{10,}/,
   ];
 
   let cleaned = body;
